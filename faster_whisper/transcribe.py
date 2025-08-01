@@ -3,11 +3,12 @@ import json
 import logging
 import os
 import zlib
+import re
 
 from dataclasses import asdict, dataclass
 from inspect import signature
 from math import ceil
-from typing import BinaryIO, Iterable, List, Optional, Tuple, Union
+from typing import BinaryIO, Iterable, List, Optional, Tuple, Union, Set
 from warnings import warn
 
 import ctranslate2
@@ -830,6 +831,11 @@ class WhisperModel:
             - a generator over transcribed segments
             - an instance of TranscriptionInfo
         """
+        
+        hotwords_s =  ' '.join(word.strip().lower() for word in re.split(r'[^a-zA-Z0-9]', hotwords) if word.strip())
+
+        hot_set = set(hotwords_s)
+        
         sampling_rate = self.feature_extractor.sampling_rate
 
         if multilingual and not self.model.is_multilingual:
@@ -987,6 +993,34 @@ class WhisperModel:
         )
 
         return segments, info
+
+
+    def _detect_hotword_hallucination(  
+        self,   
+        text: str,   
+        hot_set: Optional[Set[str]],  
+        threshold: float = 0.7
+    ) -> bool:  
+        """  
+        Detect if the transcribed text is predominantly hotwords (hallucination).  
+        """  
+        if not hot_set or not text.strip():  
+            return False     
+
+        text_s =  ' '.join(word.strip().lower() for word in re.split(r'[^a-zA-Z0-9]', text) if word.strip())
+
+        if len(text_s) == 0:  
+            return False 
+
+        match_count =0
+        
+        for word in text_s:
+            if word in hot_set:
+                match_count += 1
+
+        hotword_ratio = match_count / len(text_s)
+
+        return hotword_ratio >= threshold
 
     def _split_segments_by_timestamps(
         self,
@@ -1146,6 +1180,7 @@ class WhisperModel:
             segment_duration = segment_size * self.feature_extractor.time_per_frame
             segment = pad_or_trim(segment)
 
+
             if self.logger.isEnabledFor(logging.DEBUG):
                 self.logger.debug(
                     "Processing segment at %s", format_timestamp(time_offset)
@@ -1171,13 +1206,45 @@ class WhisperModel:
                 prefix=options.prefix if seek == 0 else None,
                 hotwords=options.hotwords,
             )
-
+        
             (
                 result,
                 avg_logprob,
                 temperature,
                 compression_ratio,
             ) = self.generate_with_fallback(encoder_output, prompt, tokenizer, options)
+ 
+            tokens = result.sequences_ids[0]  
+            text = tokenizer.decode(tokens).strip()  
+            
+            # Check if this chunk is hotword hallucinated  
+            is_hallucinated = (options.hotwords and   
+                            self._detect_hotword_hallucination(text, options.hotwords))  
+            
+            if is_hallucinated:  
+                self.logger.debug(  
+                    "Hotword hallucination detected, regenerating without hotwords: '%s'",  
+                    text[:50] + "..." if len(text) > 50 else text  
+                )  
+                
+                # Regenerate with hotwords disabled using empty prefix approach  
+                clean_prompt = self.get_prompt(  
+                    tokenizer,  
+                    previous_tokens,  # Use the actual previous_tokens definition  
+                    without_timestamps=options.without_timestamps,  
+                    prefix="",  # Empty prefix disables hotwords  
+                    hotwords=None  # Disable hotwords  
+                )  
+                
+                # Regenerate the chunk  
+                (  
+                    result,  
+                    avg_logprob,  
+                    temperature,  
+                    compression_ratio,  
+                ) = self.generate_with_fallback(encoder_output, clean_prompt, tokenizer, options)  
+            
+
 
             if options.no_speech_threshold is not None:
                 # no voice activity check
@@ -1189,6 +1256,19 @@ class WhisperModel:
                 ):
                     # don't skip if the logprob is high enough, despite the no_speech_prob
                     should_skip = False
+
+                # if (options.hotwords and   
+                #     result.no_speech_prob > 0.4 and  # moderate noise probability  
+                #     self._detect_hotword_hallucination(  
+                #         tokenizer.decode(tokens).strip(),   
+                #         options.hotwords,   
+                #         threshold=0.5  # lower threshold for noise segments  
+                #     )):  
+                    # should_skip = True  
+                    # self.logger.debug(  
+                    #     "Hotword hallucination detected in noisy segment (%f no_speech_prob)",  
+                    #     result.no_speech_prob  
+                    # ) 
 
                 if should_skip:
                     self.logger.debug(
@@ -1376,7 +1456,8 @@ class WhisperModel:
         decode_result = None
         all_results = []
         below_cr_threshold_results = []
-
+ 
+        need_hotwords = True
         max_initial_timestamp_index = int(
             round(options.max_initial_timestamp / self.time_precision)
         )
@@ -1397,6 +1478,24 @@ class WhisperModel:
             )
 
         for temperature in options.temperatures:
+
+        #     current_prompt  = prompt
+
+        #     need_hotwords = not self._detect_hotword_hallucination( options.initial_prompt ,hotwords=options.hotwords)
+
+        #     if not need_hotwords:  
+
+        #         current_prompt = self.get_prompt(  
+        #             tokenizer,  
+        #             previous_tokens,  
+        #             without_timestamps=options.without_timestamps,  
+        #             prefix=options.prefix,  
+        #             hotwords=None  # Disable hotwords  
+        #         )  
+        #         self.logger.debug(  
+        #             "Regenerating with hotwords disabled (need_hotwords=False)"  
+        #         )  
+
             if temperature > 0:
                 kwargs = {
                     "beam_size": 1,
