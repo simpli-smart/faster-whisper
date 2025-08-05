@@ -777,7 +777,7 @@ class WhisperModel:
         self,
         audio: Union[str, BinaryIO, np.ndarray],
         language: Optional[str] = None,
-        task: str = "translate",
+        task: str = "transcribe",
         log_progress: bool = False,
         beam_size: int = 5,
         best_of: int = 5,
