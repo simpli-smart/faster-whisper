@@ -3,11 +3,12 @@ import json
 import logging
 import os
 import zlib
+import re
 
 from dataclasses import asdict, dataclass
 from inspect import signature
 from math import ceil
-from typing import BinaryIO, Iterable, List, Optional, Tuple, Union
+from typing import BinaryIO, Iterable, List, Optional, Tuple, Union, Set
 from warnings import warn
 
 import ctranslate2
@@ -172,6 +173,8 @@ class BatchedInferencePipeline:
 
         return segmented_outputs
 
+
+
     def generate_segment_batched(
         self,
         features: np.ndarray,
@@ -190,6 +193,7 @@ class BatchedInferencePipeline:
             without_timestamps=options.without_timestamps,
             hotwords=options.hotwords,
         )
+
 
         if options.max_new_tokens is not None:
             max_length = len(prompt) + options.max_new_tokens
@@ -219,6 +223,7 @@ class BatchedInferencePipeline:
 
             for i, language_token in enumerate(language_tokens):
                 prompts[i][language_token_index] = language_token
+    
 
         results = self.model.model.generate(
             encoder_output,
@@ -237,6 +242,7 @@ class BatchedInferencePipeline:
         )
 
         output = []
+
         for result in results:
             # return scores
             seq_len = len(result.sequences_ids[0])
@@ -249,6 +255,62 @@ class BatchedInferencePipeline:
                     tokens=result.sequences_ids[0],
                 )
             )
+
+        # After generating results, check each one for hallucination  
+        for i, result in enumerate(results):  
+            tokens = result.sequences_ids[0]  
+            text = tokenizer.decode(tokens).strip()  
+            
+            # Check if this chunk is hotword hallucinated  
+            is_hallucinated = (options.hotwords and   
+                            self.model._detect_hotword_hallucination(text, options.hotwords))  
+            
+            if is_hallucinated:  
+                self.model.logger.debug(  # Use self.model.logger  
+                    "Hotword hallucination detected in batch item %d, regenerating without hotwords: '%s'",  
+                    i, text[:50] + "..." if len(text) > 50 else text  
+                )  
+                
+                # Create clean prompt without hotwords  
+                clean_prompt = self.model.get_prompt(  
+                    tokenizer,  
+                    tokenizer.encode(options.initial_prompt) if options.initial_prompt else [],  
+                    without_timestamps=options.without_timestamps,  
+                    prefix="",  
+                    hotwords=None  
+                )  
+                
+                # Re-encode the specific feature for this item  
+                clean_encoder_output = self.model.encode(features[i:i+1])  
+                
+                # Regenerate just this item  
+                clean_result = self.model.model.generate(  
+                    clean_encoder_output,  
+                    [clean_prompt],  
+                    beam_size=options.beam_size,  
+                    patience=options.patience,  
+                    length_penalty=options.length_penalty,  
+                    max_length=max_length,  
+                    suppress_blank=options.suppress_blank,  
+                    suppress_tokens=options.suppress_tokens,  
+                    return_scores=True,  
+                    return_no_speech_prob=True,  
+                    sampling_temperature=options.temperatures[0],  
+                    repetition_penalty=options.repetition_penalty,  
+                    no_repeat_ngram_size=options.no_repeat_ngram_size,  
+                )[0]  
+                
+                # Update the result in the output  
+                seq_len = len(clean_result.sequences_ids[0])  
+                cum_logprob = clean_result.scores[0] * (seq_len**options.length_penalty)  
+                
+                output[i] = dict(  
+                    avg_logprob=cum_logprob / (seq_len + 1),  
+                    no_speech_prob=clean_result.no_speech_prob,  
+                    tokens=clean_result.sequences_ids[0],  
+                )
+
+
 
         return encoder_output, output
 
@@ -746,7 +808,7 @@ class WhisperModel:
         prepend_punctuations: str = "\"'“¿([{-",
         append_punctuations: str = "\"'.。,，!！?？:：”)]}、",
         multilingual: bool = False,
-        vad_filter: bool = False,
+        vad_filter: bool =  False,
         vad_parameters: Optional[Union[dict, VadOptions]] = None,
         max_new_tokens: Optional[int] = None,
         chunk_length: Optional[int] = None,
@@ -830,6 +892,12 @@ class WhisperModel:
             - a generator over transcribed segments
             - an instance of TranscriptionInfo
         """
+
+        
+        hotwords_s =  ' '.join(word.strip().lower() for word in re.split(r'[^a-zA-Z0-9]', hotwords) if word.strip())
+
+        hot_set = set(hotwords_s)
+        
         sampling_rate = self.feature_extractor.sampling_rate
 
         if multilingual and not self.model.is_multilingual:
@@ -987,6 +1055,34 @@ class WhisperModel:
         )
 
         return segments, info
+
+
+    def _detect_hotword_hallucination(  
+        self,   
+        text: str,   
+        hot_set: Optional[Set[str]],  
+        threshold: float = 0.7
+    ) -> bool:  
+        """  
+        Detect if the transcribed text is predominantly hotwords (hallucination).  
+        """  
+        if not hot_set or not text.strip():  
+            return False     
+
+        text_s =  ' '.join(word.strip().lower() for word in re.split(r'[^a-zA-Z0-9]', text) if word.strip())
+
+        if len(text_s) == 0:  
+            return False 
+
+        match_count =0
+        
+        for word in text_s:
+            if word in hot_set:
+                match_count += 1
+
+        hotword_ratio = match_count / len(text_s)
+
+        return hotword_ratio >= threshold
 
     def _split_segments_by_timestamps(
         self,
@@ -1146,6 +1242,7 @@ class WhisperModel:
             segment_duration = segment_size * self.feature_extractor.time_per_frame
             segment = pad_or_trim(segment)
 
+
             if self.logger.isEnabledFor(logging.DEBUG):
                 self.logger.debug(
                     "Processing segment at %s", format_timestamp(time_offset)
@@ -1171,13 +1268,45 @@ class WhisperModel:
                 prefix=options.prefix if seek == 0 else None,
                 hotwords=options.hotwords,
             )
-
+        
             (
                 result,
                 avg_logprob,
                 temperature,
                 compression_ratio,
             ) = self.generate_with_fallback(encoder_output, prompt, tokenizer, options)
+ 
+            tokens = result.sequences_ids[0]  
+            text = tokenizer.decode(tokens).strip()  
+            
+            # Check if this chunk is hotword hallucinated  
+            is_hallucinated = (options.hotwords and   
+                            self._detect_hotword_hallucination(text, options.hotwords))  
+            
+            if is_hallucinated:  
+                self.logger.debug(  
+                    "Hotword hallucination detected, regenerating without hotwords: '%s'",  
+                    text[:50] + "..." if len(text) > 50 else text  
+                )  
+                
+                # Regenerate with hotwords disabled using empty prefix approach  
+                clean_prompt = self.get_prompt(  
+                    tokenizer,  
+                    previous_tokens,  # Use the actual previous_tokens definition  
+                    without_timestamps=options.without_timestamps,  
+                    prefix="",  # Empty prefix disables hotwords  
+                    hotwords=None  # Disable hotwords  
+                )  
+                
+                # Regenerate the chunk  
+                (  
+                    result,  
+                    avg_logprob,  
+                    temperature,  
+                    compression_ratio,  
+                ) = self.generate_with_fallback(encoder_output, clean_prompt, tokenizer, options)  
+            
+
 
             if options.no_speech_threshold is not None:
                 # no voice activity check
@@ -1376,7 +1505,7 @@ class WhisperModel:
         decode_result = None
         all_results = []
         below_cr_threshold_results = []
-
+ 
         max_initial_timestamp_index = int(
             round(options.max_initial_timestamp / self.time_precision)
         )
@@ -1397,6 +1526,7 @@ class WhisperModel:
             )
 
         for temperature in options.temperatures:
+
             if temperature > 0:
                 kwargs = {
                     "beam_size": 1,
