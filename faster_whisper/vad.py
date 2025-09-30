@@ -3,12 +3,18 @@ import functools
 import os
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Union , Dict, List, Optional, Tuple
+from enum import Enum
+
 
 import numpy as np
 
 from faster_whisper.utils import get_assets_path
 
+class VadBackend(Enum):  
+    SILERO = "silero"  
+    PYANNOTE = "pyannote"
+    WEIGHTED_COMBINATION = "weighted"
 
 # The code below is adapted from https://github.com/snakers4/silero-vad.
 @dataclass
@@ -40,6 +46,21 @@ class VadOptions:
     max_speech_duration_s: float = float("inf")
     min_silence_duration_ms: int = 2000
     speech_pad_ms: int = 400
+ 
+    backend: VadBackend = VadBackend.SILERO  
+    pyannote_model: str = "pyannote/segmentation-3.0"  
+    pyannote_auth_token: Optional[str] = None 
+    
+    min_duration_on: float = 0.0  
+    min_duration_off: float = 0.0
+
+    # Weighted ensemble parameters
+    silero_weight: float = 0.5
+    pyannote_weight: float = 0.5
+    combination_threshold: float = 0.5
+    combination_method: str = "confidence"  # "confidence" | "majority"
+    min_overlap_duration_ms: int = 200
+    max_gap_duration_ms: int = 1000
 
 
 def get_speech_timestamps(
@@ -48,7 +69,7 @@ def get_speech_timestamps(
     sampling_rate: int = 16000,
     **kwargs,
 ) -> List[dict]:
-    """This method is used for splitting long audios into speech chunks using silero VAD.
+    """This method is used for splitting long audios into speech chunks using VAD.
 
     Args:
       audio: One dimensional float array.
@@ -62,6 +83,25 @@ def get_speech_timestamps(
     if vad_options is None:
         vad_options = VadOptions(**kwargs)
 
+    # Use Pyannote VAD if specified
+    if vad_options.backend == VadBackend.PYANNOTE:
+        try:
+            pyannote_model = get_pyannote_vad_model(
+                vad_options.pyannote_model, 
+                vad_options.pyannote_auth_token
+            )
+            return pyannote_model.get_speech_timestamps(audio, vad_options, sampling_rate)
+        except Exception as e:
+            print(f"Warning: Failed to load pyannote VAD model: {e}")
+            print("Falling back to Silero-only VAD")
+            # Fall back to Silero
+            vad_options.backend = VadBackend.SILERO
+
+    # Weighted ensemble of Silero + Pyannote
+    if vad_options.backend == VadBackend.WEIGHTED_COMBINATION:
+        return get_weighted_combination_timestamps(audio, vad_options, sampling_rate)
+
+    # Silero VAD (default)
     threshold = vad_options.threshold
     neg_threshold = vad_options.neg_threshold
     min_speech_duration_ms = vad_options.min_speech_duration_ms
@@ -370,3 +410,263 @@ def merge_segments(segments_list, vad_options: VadOptions, sampling_rate: int = 
         }
     )
     return merged_segments
+
+
+def _pad_and_merge_like_silero(
+    speeches: List[dict],
+    audio_length_samples: int,
+    sampling_rate: int,
+    speech_pad_ms: int,
+) -> List[dict]:
+    if not speeches:
+        return []
+    speeches = sorted(speeches, key=lambda s: s["start"])  # ensure order
+    speech_pad_samples = int(sampling_rate * speech_pad_ms / 1000)
+    for i, speech in enumerate(speeches):
+        if i == 0:
+            speech["start"] = int(max(0, speech["start"] - speech_pad_samples))
+        if i != len(speeches) - 1:
+            silence_duration = speeches[i + 1]["start"] - speech["end"]
+            if silence_duration < 2 * speech_pad_samples:
+                speech["end"] += int(silence_duration // 2)
+                speeches[i + 1]["start"] = int(
+                    max(0, speeches[i + 1]["start"] - silence_duration // 2)
+                )
+            else:
+                speech["end"] = int(
+                    min(audio_length_samples, speech["end"] + speech_pad_samples)
+                )
+                speeches[i + 1]["start"] = int(
+                    max(0, speeches[i + 1]["start"] - speech_pad_samples)
+                )
+        else:
+            speech["end"] = int(
+                min(audio_length_samples, speech["end"] + speech_pad_samples)
+            )
+    return speeches
+
+
+class PyannoteVADModel:  
+    def __init__(self, model_name: str = "pyannote/segmentation-3.0", auth_token: Optional[str] = None):  
+        try:  
+            from pyannote.audio import Model  
+            from pyannote.audio.pipelines import VoiceActivityDetection  
+        except ImportError as e:  
+            raise RuntimeError(  
+                "Pyannote VAD requires: pip install pyannote.audio"  
+            ) from e  
+          
+        self.model = Model.from_pretrained(model_name, use_auth_token=auth_token)  
+        self.pipeline = VoiceActivityDetection(segmentation=self.model)  
+      
+    def get_speech_timestamps(  
+        self,   
+        audio: np.ndarray,   
+        vad_options: VadOptions,  
+        sampling_rate: int = 16000  
+    ) -> List[dict]:  
+        # Prefer in-memory inference to avoid disk I/O; fallback to temp file if needed
+        hyper_parameters = {
+            "min_duration_on": vad_options.min_duration_on,
+            "min_duration_off": vad_options.min_duration_off,
+        }
+        self.pipeline.instantiate(hyper_parameters)
+
+        try:
+            import torch
+            waveform = torch.from_numpy(audio.astype(np.float32))
+            # Ensure shape (num_channels, num_samples)
+            if waveform.ndim == 1:
+                waveform = waveform.unsqueeze(0)
+            file_obj = {"waveform": waveform, "sample_rate": sampling_rate}
+            vad_result = self.pipeline(file_obj)
+        except Exception:
+            # Fallback to temporary WAV path
+            import tempfile
+            import soundfile as sf
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
+                sf.write(tmp_file.name, audio, sampling_rate)
+                try:
+                    vad_result = self.pipeline(tmp_file.name)
+                finally:
+                    import os as _os
+                    _os.unlink(tmp_file.name)
+
+        # Convert pyannote.core.Annotation to faster-whisper format
+        speeches = []
+        for segment in vad_result.itersegments():
+            start_sample = int(segment.start * sampling_rate)
+            end_sample = int(segment.end * sampling_rate)
+            duration_ms = (end_sample - start_sample) * 1000 / sampling_rate
+            if duration_ms >= vad_options.min_speech_duration_ms:
+                speeches.append({"start": start_sample, "end": end_sample})
+
+        # Apply padding/merging similar to Silero for qualitative parity
+        speeches = _pad_and_merge_like_silero(
+            speeches,
+            audio_length_samples=len(audio),
+            sampling_rate=sampling_rate,
+            speech_pad_ms=vad_options.speech_pad_ms,
+        )
+
+        return speeches  
+
+
+def get_weighted_combination_timestamps(
+    audio: np.ndarray,
+    vad_options: VadOptions,
+    sampling_rate: int = 16000,
+) -> List[dict]:
+    # Silero segments
+    silero_options = VadOptions(
+        backend=VadBackend.SILERO,
+        threshold=vad_options.threshold,
+        neg_threshold=vad_options.neg_threshold,
+        min_speech_duration_ms=vad_options.min_speech_duration_ms,
+        max_speech_duration_s=vad_options.max_speech_duration_s,
+        min_silence_duration_ms=vad_options.min_silence_duration_ms,
+        speech_pad_ms=vad_options.speech_pad_ms,
+    )
+    silero_segments = get_speech_timestamps(audio, silero_options, sampling_rate)
+
+    # Pyannote segments
+    pyannote_options = VadOptions(
+        backend=VadBackend.PYANNOTE,
+        min_speech_duration_ms=vad_options.min_speech_duration_ms,
+        speech_pad_ms=vad_options.speech_pad_ms,
+        min_duration_on=vad_options.min_duration_on,
+        min_duration_off=vad_options.min_duration_off,
+        pyannote_model=vad_options.pyannote_model,
+        pyannote_auth_token=vad_options.pyannote_auth_token,
+    )
+    try:
+        pyannote_segments = get_speech_timestamps(audio, pyannote_options, sampling_rate)
+    except Exception:
+        # If Pyannote fails, return Silero
+        return silero_segments
+
+    # Convert to time ranges (seconds)
+    def to_ranges(segs):
+        return [(s["start"] / sampling_rate, s["end"] / sampling_rate) for s in segs]
+
+    s_ranges = to_ranges(silero_segments)
+    p_ranges = to_ranges(pyannote_segments)
+
+    # Build boundary points
+    points = sorted(set([t for r in s_ranges for t in r] + [t for r in p_ranges for t in r]))
+    if not points:
+        return []
+
+    intervals = []
+    for i in range(len(points) - 1):
+        a, b = points[i], points[i + 1]
+        # skip zero-length
+        if b <= a:
+            continue
+        # compute overlap ratio as confidence in [0,1]
+        def overlap_conf(a,b,ranges):
+            total=0.0
+            for rs,re in ranges:
+                ov_start = a if a>rs else rs
+                ov_end = b if b<re else re
+                if ov_end>ov_start:
+                    total += ov_end-ov_start
+            return total / (b-a)
+        s_conf = overlap_conf(a,b,s_ranges)
+        p_conf = overlap_conf(a,b,p_ranges)
+
+        method = (vad_options.combination_method or "confidence").lower()
+        keep = False
+        if method in ("confidence","weighted"):
+            score = (vad_options.silero_weight * s_conf +
+                     vad_options.pyannote_weight * p_conf)
+            keep = score >= vad_options.combination_threshold
+        elif method == "majority":
+            votes = int(s_conf > 0.0) + int(p_conf > 0.0)
+            keep = votes >= 1
+        else:
+            # fallback to confidence
+            score = (vad_options.silero_weight * s_conf +
+                     vad_options.pyannote_weight * p_conf)
+            keep = score >= vad_options.combination_threshold
+
+        if keep:
+            intervals.append((a, b))
+
+    # Merge intervals considering max_gap and min_overlap
+    if not intervals:
+        return []
+    merged = []
+    current_start, current_end = intervals[0]
+    max_gap = vad_options.max_gap_duration_ms / 1000.0
+    min_keep = vad_options.min_overlap_duration_ms / 1000.0
+    for a, b in intervals[1:]:
+        if a - current_end <= max_gap:
+            current_end = max(current_end, b)
+        else:
+            if current_end - current_start >= min_keep:
+                merged.append({
+                    "start": int(current_start * sampling_rate),
+                    "end": int(current_end * sampling_rate),
+                })
+            current_start, current_end = a, b
+    if current_end - current_start >= min_keep:
+        merged.append({
+            "start": int(current_start * sampling_rate),
+            "end": int(current_end * sampling_rate),
+        })
+
+    # Apply Silero-like padding/merge for qualitative parity
+    merged = _pad_and_merge_like_silero(
+        merged,
+        audio_length_samples=len(audio),
+        sampling_rate=sampling_rate,
+        speech_pad_ms=vad_options.speech_pad_ms,
+    )
+    return merged
+  
+@functools.lru_cache  
+def get_pyannote_vad_model(model_name: str = "pyannote/segmentation-3.0", auth_token: Optional[str] = None):  
+    """Returns the Pyannote VAD model instance."""  
+    return PyannoteVADModel(model_name, auth_token)
+
+def get_default_vad_options(backend: VadBackend = VadBackend.SILERO) -> VadOptions:
+    """Get default VAD options for a specific backend.
+    
+    Args:
+        backend: The VAD backend to use
+        
+    Returns:
+        VadOptions with default parameters for the specified backend
+    """
+    if backend == VadBackend.SILERO:
+        return VadOptions(
+            backend=backend,
+            threshold=0.5,
+            min_speech_duration_ms=500,
+            speech_pad_ms=400,
+            min_silence_duration_ms=2000
+        )
+    elif backend == VadBackend.PYANNOTE:
+        return VadOptions(
+            backend=backend,
+            min_speech_duration_ms=500,
+            speech_pad_ms=400,
+            min_duration_on=0.1,
+            min_duration_off=0.1,
+            pyannote_model="pyannote/segmentation-3.0"
+        )
+    elif backend == VadBackend.WEIGHTED_COMBINATION:
+        return VadOptions(
+            backend=backend,
+            silero_weight=0.5,
+            pyannote_weight=0.5,
+            combination_threshold=0.5,
+            combination_method="weighted",
+            min_overlap_duration_ms=200,
+            max_gap_duration_ms=1000,
+        )
+    else:
+        raise ValueError(f"Unknown backend: {backend}")
+
+
